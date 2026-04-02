@@ -4,8 +4,9 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Dict, Any, Optional
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
@@ -46,22 +47,29 @@ class PostgresClient:
             sslmode=sslmode
         )
 
+    def ensure_connection(self):
+        if self.connection is None or self.connection.closed != 0:
+            self.connect()
+
     def close(self):
         if self.connection:
             self.connection.close()
 
     def query(self, sql: str) -> List[Dict[str, Any]]:
+        self.ensure_connection()
         with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql)
             result = cursor.fetchall()
             return [dict(row) for row in result]
 
     def get_tables(self) -> List[str]:
+        self.ensure_connection()
         with self.connection.cursor() as cursor:
             cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
             return [row[0] for row in cursor.fetchall()]
 
     def get_columns(self, table_name: str) -> List[Dict[str, Any]]:
+        self.ensure_connection()
         with self.connection.cursor() as cursor:
             cursor.execute("""
                 SELECT column_name, data_type, is_nullable 
@@ -176,23 +184,17 @@ def handle_call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "isError": True
         }
 
-@app.route('/', methods=['GET', 'POST'])
-def mcp():
-    if request.method == 'GET':
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "tools": TOOLS
-            }
-        })
-
-    data = request.get_json()
-    method = data.get('method')
-    msg_id = data.get('id')
-
-    if method == 'initialize':
-        return jsonify({
+@app.route('/sse', methods=['GET'])
+def sse_endpoint():
+    msg_id = request.args.get('id', '1')
+    
+    scheme = request.scheme
+    host = request.host
+    endpoint_url = f"{scheme}://{host}/messages"
+    
+    def generate():
+        yield f"event: endpoint\ndata: {endpoint_url}\n\n"
+        result = {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
@@ -205,9 +207,21 @@ def mcp():
                     "version": "1.0.0"
                 }
             }
-        })
+        }
+        yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+        while True:
+            yield ": heartbeat\n\n"
+            time.sleep(30)
+    
+    return Response(generate(), content_type='text/event-stream')
 
-    elif method == 'tools/list':
+@app.route('/messages', methods=['POST'])
+def message_endpoint():
+    data = request.get_json()
+    msg_id = data.get('id')
+    method = data.get('method')
+
+    if method == 'tools/list':
         return jsonify({
             "jsonrpc": "2.0",
             "id": msg_id,
