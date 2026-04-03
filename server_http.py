@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from typing import List, Dict, Any, Optional
-from flask import Flask, request, jsonify, Response
+from queue import Queue
+from typing import List, Dict, Any
+from flask import Flask, request, Response
 from dotenv import load_dotenv
 import time
 
 load_dotenv()
 
+# 配置读取
+DB_TYPE = os.getenv("DB_TYPE", "mysql")
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_USER = os.getenv("DB_USER", "postgres")
+DB_PORT_DEFAULT = "5432" if DB_TYPE == "postgres" else "3306"
+DB_PORT = int(os.getenv("DB_PORT", DB_PORT_DEFAULT))
+DB_USER = os.getenv("DB_USER", "root" if DB_TYPE == "mysql" else "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_NAME = os.getenv("DB_NAME", "text2sql_demo" if DB_TYPE == "mysql" else "postgres")
 DB_SSL = os.getenv("DB_SSL", "false").lower() == "true"
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -32,13 +34,30 @@ def is_read_only_query(sql: str) -> bool:
             return False
     return True
 
-class PostgresClient:
+class DatabaseClient:
+    def connect(self):
+        pass
+    def ensure_connection(self):
+        pass
+    def close(self):
+        pass
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        pass
+    def get_tables(self) -> List[str]:
+        pass
+    def get_columns(self, table_name: str) -> List[Dict[str, Any]]:
+        pass
+
+class PostgresClient(DatabaseClient):
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
     def __init__(self):
         self.connection = None
 
     def connect(self):
         sslmode = "require" if DB_SSL else "disable"
-        self.connection = psycopg2.connect(
+        self.connection = self.psycopg2.connect(
             host=DB_HOST,
             port=DB_PORT,
             user=DB_USER,
@@ -57,10 +76,9 @@ class PostgresClient:
 
     def query(self, sql: str) -> List[Dict[str, Any]]:
         self.ensure_connection()
-        with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+        with self.connection.cursor(cursor_factory=self.RealDictCursor) as cursor:
             cursor.execute(sql)
-            result = cursor.fetchall()
-            return [dict(row) for row in result]
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_tables(self) -> List[str]:
         self.ensure_connection()
@@ -72,22 +90,81 @@ class PostgresClient:
         self.ensure_connection()
         with self.connection.cursor() as cursor:
             cursor.execute("""
-                SELECT column_name, data_type, is_nullable 
-                FROM information_schema.columns 
-                WHERE table_schema = 'public' AND table_name = %s 
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
                 ORDER BY ordinal_position
             """, (table_name,))
-            columns = []
-            for row in cursor.fetchall():
-                columns.append({
-                    "name": row[0],
-                    "type": row[1],
-                    "nullable": row[2] == "YES"
-                })
-            return columns
+            return [{
+                "name": row[0],
+                "type": row[1],
+                "nullable": row[2] == "YES"
+            } for row in cursor.fetchall()]
+
+class MySQLClient(DatabaseClient):
+    import mysql.connector
+
+    def __init__(self):
+        self.connection = None
+
+    def connect(self):
+        self.connection = self.mysql.connector.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+
+    def ensure_connection(self):
+        if self.connection is None or not self.connection.is_connected():
+            self.connect()
+
+    def close(self):
+        if self.connection and self.connection.is_connected():
+            self.connection.close()
+
+    def query(self, sql: str) -> List[Dict[str, Any]]:
+        self.ensure_connection()
+        cursor = self.connection.cursor(dictionary=True)
+        cursor.execute(sql)
+        result = cursor.fetchall()
+        cursor.close()
+        return result
+
+    def get_tables(self) -> List[str]:
+        self.ensure_connection()
+        cursor = self.connection.cursor()
+        cursor.execute(f"SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s", (DB_NAME,))
+        tables = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        return tables
+
+    def get_columns(self, table_name: str) -> List[Dict[str, Any]]:
+        self.ensure_connection()
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+            ORDER BY ORDINAL_POSITION
+        """, (DB_NAME, table_name))
+        columns = [{
+            "name": row[0],
+            "type": row[1],
+            "nullable": row[2] == "YES"
+        } for row in cursor.fetchall()]
+        cursor.close()
+        return columns
 
 app = Flask(__name__)
-db = PostgresClient()
+sse_queue = Queue()
+
+# 根据 DB_TYPE 创建客户端
+if DB_TYPE in ("postgres", "supabase"):
+    db = PostgresClient()
+else:
+    db = MySQLClient()
 
 TOOLS = [
     {
@@ -151,9 +228,7 @@ def handle_call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     elif name == "get_schema":
         try:
             tables = db.get_tables()
-            schema = {}
-            for table in tables:
-                schema[table] = db.get_columns(table)
+            schema = {table: db.get_columns(table) for table in tables}
             return {
                 "content": [
                     {
@@ -184,73 +259,70 @@ def handle_call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "isError": True
         }
 
-@app.route('/sse', methods=['GET'])
+@app.route("/sse", methods=["GET"])
 def sse_endpoint():
-    msg_id = request.args.get('id', '1')
-    
     scheme = request.scheme
     host = request.host
     endpoint_url = f"{scheme}://{host}/messages"
-    
+
+    local_queue = Queue()
+    global sse_queue
+    sse_queue = local_queue
+
     def generate():
         yield f"event: endpoint\ndata: {endpoint_url}\n\n"
-        result = {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "text2sql-mcp-server",
-                    "version": "1.0.0"
-                }
-            }
-        }
-        yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
         while True:
+            if not local_queue.empty():
+                message = local_queue.get()
+                yield f"data: {json.dumps(message, ensure_ascii=False)}\n\n"
             yield ": heartbeat\n\n"
-            time.sleep(30)
-    
-    return Response(generate(), content_type='text/event-stream')
+            time.sleep(0.1)
 
-@app.route('/messages', methods=['POST'])
+    return Response(generate(), content_type="text/event-stream")
+
+@app.route("/messages", methods=["POST"])
 def message_endpoint():
     data = request.get_json()
-    msg_id = data.get('id')
-    method = data.get('method')
+    msg_id = data.get("id")
+    method = data.get("method")
 
-    if method == 'tools/list':
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "tools": TOOLS
-            }
-        })
+    # 通知消息没有 id，不需要响应
+    if msg_id is None:
+        return "", 200
 
-    elif method == 'tools/call':
-        params = data.get('params', {})
-        name = params.get('name')
-        args = params.get('arguments', {})
-        result = handle_call_tool(name, args)
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": result
-        })
+    response = {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+    }
 
+    if method == "initialize":
+        response["result"] = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "text2sql-mcp-server", "version": "1.0.0"}
+        }
+    elif method == "tools/list":
+        response["result"] = {"tools": TOOLS}
+    elif method == "tools/call":
+        params = data.get("params", {})
+        response["result"] = handle_call_tool(params.get("name"), params.get("arguments", {}))
     else:
-        return jsonify({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {
-                "code": -32601,
-                "message": f"Method not found: {method}"
-            }
-        })
+        response["error"] = {
+            "code": -32601,
+            "message": f"Method not found: {method}"
+        }
+
+    sse_queue.put(response)
+    return "", 200
 
 if __name__ == "__main__":
-    db.connect()
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    try:
+        db.connect()
+        print(f"✓ Successfully connected to {DB_TYPE} database")
+        print(f"✓ MCP SSE server running on http://0.0.0.0:{PORT}")
+        print(f"✓ SSE endpoint: http://0.0.0.0:{PORT}/sse")
+    except Exception as e:
+        print(f"✗ Failed to connect to {DB_TYPE} database: {str(e)}")
+        print("Please check your database connection settings in .env")
+        exit(1)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
